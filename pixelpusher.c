@@ -13,7 +13,6 @@
 typedef struct {
 	uint8_t index;
 	uint8_t format;
-	uint16_t pixels;
 } vendor_ctrl_chan_cfg_t;
 
 #define PP_FORMAT_UNSET	0x0
@@ -35,7 +34,6 @@ typedef struct {
 	alarm_id_t xfer_finished_delay_alarm;
 	struct semaphore xfer_finished_sem;
 	/* Buffer */
-	uint16_t cfg_bufsz;
 	uint8_t buf[PIXDATA_BUFSZ];
 } pp_channel_t;
 
@@ -46,7 +44,7 @@ static pp_channel_t pp_channels[NUM_CHANNELS];
 static bool pp_pio_deinit(uint8_t index);
 static bool pp_dma_deinit(uint8_t index);
 
-static bool pp_init_channel(uint8_t index, uint8_t format, uint16_t pixels)
+static bool pp_init_channel(uint8_t index, uint8_t format)
 {
 	bool success = true;
 	vendor_ctrl_chan_cfg_t *cfg;
@@ -60,15 +58,6 @@ static bool pp_init_channel(uint8_t index, uint8_t format, uint16_t pixels)
 		default: success = false; goto out;
 	}
 
-	bytes = pixels * Bpp;
-	if (bytes > PIXDATA_BUFSZ) {
-		printf("ERROR: Requested pixel count would require a "
-			"%d byte buffer, but our limit is %d\n",
-			bytes, PIXDATA_BUFSZ);
-		success = false;
-		goto out;
-	}
-
 	chan = &pp_channels[index];
 
 	if (chan->configured) {
@@ -79,12 +68,9 @@ static bool pp_init_channel(uint8_t index, uint8_t format, uint16_t pixels)
 	cfg = &chan->cfg;
 	cfg->index = index;
 	cfg->format = format;
-	cfg->pixels = pixels;
-	chan->cfg_bufsz = bytes;
 	chan->configured = true;
 
-	printf("Configuring channel %d, pixels %d, cfg_bufsz %d\n",
-		cfg->index, cfg->pixels, chan->cfg_bufsz);
+	printf("Configuring channel %d\n", cfg->index);
 
 out:
 	if (!success) printf("Failed to configure PIO\n");
@@ -111,7 +97,7 @@ static bool pp_pio_init(uint8_t index)
 		goto out;
 	}
 
-	printf("Configured PIO at %p for pin %d\n", chan->pio, pin);
+	printf("Configured PIO at %p for pin %d sm %d offset %d\n", chan->pio, pin, chan->sm, chan->offset);
 
 	ws2812_program_init(chan->pio, chan->sm, chan->offset, pin, 800000);
 
@@ -183,7 +169,6 @@ static bool pp_dma_init(uint8_t index)
 {
 	bool success = true;
 
-
 	pp_channel_t *chan = &pp_channels[index];
 
 	/* ASSUMPTION: we're the only code running and we can have a
@@ -199,15 +184,18 @@ static bool pp_dma_init(uint8_t index)
 	channel_config_set_dreq(&channel_config, pio_get_dreq(chan->pio, chan->sm, true));
 	channel_config_set_transfer_data_size(&channel_config, DMA_SIZE_8);
 	channel_config_set_read_increment(&channel_config, true);
+	channel_config_set_write_increment(&channel_config, false);
+	channel_config_set_write_address_update_type(&channel_config, DMA_ADDRESS_UPDATE_NONE);
+	channel_config_set_chain_to(&channel_config, index);
 	dma_channel_configure(index, &channel_config, &chan->pio->txf[chan->sm],
-                        NULL, dma_encode_transfer_count(chan->cfg_bufsz), false);
+                        NULL, 0, false);
 	irq_set_exclusive_handler(DMA_IRQ_0, pp_dma_complete_handler);
 	dma_channel_set_irq0_enabled(index, true);
 	irq_set_enabled(DMA_IRQ_0, true);
 
 	sem_init(&chan->xfer_finished_sem, 1, 1);
 
-	printf("Configured DMA %d", index);
+	printf("Configured DMA %d\n", index);
 
 	return success;
 }
@@ -252,15 +240,15 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
 				case CONTROL_STAGE_ACK:
 					chan_cfg = (void *)&_ctrl_epbuf;
 					printf("PP_VENDOR_CTRL_REQ_CFG_CHAN "
-						"index: %d pixels: %d format: 0x%x\n",
-						chan_cfg->index, chan_cfg->pixels, chan_cfg->format);
+						"index: %d format: 0x%x\n",
+						chan_cfg->index, chan_cfg->format);
 
 					if (chan_cfg->index >= NUM_CHANNELS) {
 						success = false;
 						goto out;
 					}
 
-					success = pp_init_channel(chan_cfg->index, chan_cfg->format, chan_cfg->pixels);
+					success = pp_init_channel(chan_cfg->index, chan_cfg->format);
 					if (!success) goto out;
 
 					pp_pio_init(chan_cfg->index);
@@ -284,7 +272,7 @@ void tud_vendor_rx_cb(uint8_t itf, uint8_t const* buffer, uint16_t bufsize)
 
 	(void) itf;
 
-	uint32_t channel = buffer[0];
+	uint8_t channel = buffer[0];
 	if (channel > NUM_CHANNELS - 1) {
 		printf("Invalid channel index %d\n", channel);
 		return;
@@ -303,8 +291,9 @@ void tud_vendor_rx_cb(uint8_t itf, uint8_t const* buffer, uint16_t bufsize)
 
 	/* Copy to channel buffer and trigger DMA to PIO FIFO */
 	sem_acquire_blocking(&chan->xfer_finished_sem);
-	memcpy(chan->buf, &buffer[1], bufsize - 1);
-	dma_channel_set_read_addr(chan->cfg.index, &buffer[1], true);
+	memcpy(&chan->buf[0], &buffer[1], bufsize - 1);
+	dma_channel_transfer_from_buffer_now(chan->cfg.index, &chan->buf[0],
+		dma_encode_transfer_count(bufsize - 1));
 
 	return;
 }
